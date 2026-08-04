@@ -57,7 +57,8 @@ jobs:
 
           if [ "$STATE" = "FAILED" ]; then
             echo "--- logs del job (últimas líneas) ---"
-            oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --file - | tail -n 40 || true
+            oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --file /tmp/job-log.txt || true
+            tail -n 40 /tmp/job-log.txt || true
           fi
 
       - name: Avisa si tuvo éxito
