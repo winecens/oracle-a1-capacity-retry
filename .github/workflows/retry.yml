@@ -1,1 +1,69 @@
+name: Retry Oracle A1 capacity
 
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: oracle-retry
+  cancel-in-progress: false
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Configura credenciales OCI
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/key.pem <<'EOF'
+          ${{ secrets.OCI_KEY_CONTENT }}
+          EOF
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<CFG
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/key.pem
+          CFG
+          chmod 600 ~/.oci/config
+
+      - name: Intenta crear la instancia (Apply del stack)
+        id: apply
+        run: |
+          set -e
+          JOB_ID=$(oci resource-manager job create-apply-job \
+            --stack-id "${{ secrets.OCI_STACK_ID }}" \
+            --execution-plan-strategy AUTO_APPROVED \
+            --query 'data.id' --raw-output)
+          echo "Job creado: $JOB_ID"
+
+          STATE="ACCEPTED"
+          for i in $(seq 1 40); do
+            STATE=$(oci resource-manager job get --job-id "$JOB_ID" --query 'data."lifecycle-state"' --raw-output)
+            echo "Estado ($i): $STATE"
+            if [ "$STATE" = "SUCCEEDED" ] || [ "$STATE" = "FAILED" ]; then
+              break
+            fi
+            sleep 15
+          done
+
+          echo "final_state=$STATE" >> "$GITHUB_OUTPUT"
+
+          if [ "$STATE" = "FAILED" ]; then
+            echo "--- logs del job (últimas líneas) ---"
+            oci resource-manager job get-job-logs-content --job-id "$JOB_ID" --file - | tail -n 40 || true
+          fi
+
+      - name: Avisa si tuvo éxito
+        if: steps.apply.outputs.final_state == 'SUCCEEDED'
+        run: |
+          curl -s -d "✅ Instancia Oracle A1 (matcher besomm) creada con éxito. Revisa la consola OCI." \
+            -H "Title: Oracle A1 disponible" \
+            -H "Priority: high" \
+            "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
