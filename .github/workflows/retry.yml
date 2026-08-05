@@ -1,12 +1,15 @@
 name: Retry Oracle A1 capacity
 
 on:
-  # Cada 20 min, no cada 10: el endpoint que usamos no es LaunchInstance, es
-  # POST /jobs del Resource Manager, con un rate limit por tenant mucho mas
-  # estrecho. A 10 min, mas de la mitad de los intentos morian con un 429
-  # ("Too many requests for the tenant") SIN llegar a preguntar por capacidad.
+  # RED DE SEGURIDAD, no el disparador principal: este cron se salta franjas
+  # bajo carga del runner compartido (llego 3 veces en 3,5 h, y tarde). Quien
+  # marca la cadencia real es el Worker de Cloudflare
+  # (wine-app/workers/oracle-retry-trigger, cron 5,25,45 = cada 20 min).
+  # Aqui basta 1/hora, en franja distinta para no encadenar dos Applies: el
+  # limite que nos frena es POST /jobs del Resource Manager (429 por tenant),
+  # y a 10 min mas de la mitad de los intentos ni llegaban a pedir capacidad.
   schedule:
-    - cron: '*/20 * * * *'
+    - cron: '0 * * * *'
   workflow_dispatch: {}
 
 concurrency:
