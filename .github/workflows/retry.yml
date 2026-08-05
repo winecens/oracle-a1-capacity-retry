@@ -1,8 +1,12 @@
 name: Retry Oracle A1 capacity
 
 on:
+  # Cada 20 min, no cada 10: el endpoint que usamos no es LaunchInstance, es
+  # POST /jobs del Resource Manager, con un rate limit por tenant mucho mas
+  # estrecho. A 10 min, mas de la mitad de los intentos morian con un 429
+  # ("Too many requests for the tenant") SIN llegar a preguntar por capacidad.
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/20 * * * *'
   workflow_dispatch: {}
 
 concurrency:
@@ -35,17 +39,33 @@ jobs:
 
       - name: Intenta crear la instancia (Apply del stack)
         id: apply
+        # Verde = maquina creada. Cualquier otra cosa (429, sin capacidad, error
+        # de Terraform) sale en rojo. Antes el paso solo comprobaba que el job
+        # ARRANCARA, asi que un "Out of host capacity" salia como success.
         run: |
-          set -e
-          JOB_ID=$(oci resource-manager job create-apply-job \
-            --stack-id "${{ secrets.OCI_STACK_ID }}" \
-            --execution-plan-strategy AUTO_APPROVED \
-            --query 'data.id' --raw-output)
+          set -uo pipefail
+
+          if ! JOB_ID=$(oci resource-manager job create-apply-job \
+                --stack-id "${{ secrets.OCI_STACK_ID }}" \
+                --execution-plan-strategy AUTO_APPROVED \
+                --query 'data.id' --raw-output 2>/tmp/create_err.txt); then
+            echo "--- no se pudo crear el job ---"
+            cat /tmp/create_err.txt
+            if grep -q 'TooManyRequests' /tmp/create_err.txt; then
+              echo "resultado=RATE_LIMITED" >> "$GITHUB_OUTPUT"
+              echo "### :hourglass: 429 del Resource Manager" >> "$GITHUB_STEP_SUMMARY"
+              echo "No se llego a preguntar por capacidad. Espaciar mas los intentos." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "resultado=ERROR_CLIENTE" >> "$GITHUB_OUTPUT"
+              echo "### :x: Error al crear el job (ver log del runner)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 1
+          fi
           echo "Job creado: $JOB_ID"
 
           STATE="ACCEPTED"
           for i in $(seq 1 40); do
-            STATE=$(oci resource-manager job get --job-id "$JOB_ID" --query 'data."lifecycle-state"' --raw-output)
+            STATE=$(oci resource-manager job get --job-id "$JOB_ID" --query 'data."lifecycle-state"' --raw-output) || STATE="DESCONOCIDO"
             echo "Estado ($i): $STATE"
             if [ "$STATE" = "SUCCEEDED" ] || [ "$STATE" = "FAILED" ]; then
               break
@@ -53,15 +73,30 @@ jobs:
             sleep 15
           done
 
-          echo "final_state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "resultado=$STATE" >> "$GITHUB_OUTPUT"
 
-          if [ "$STATE" = "FAILED" ]; then
-            echo "--- logs del job (últimas líneas) ---"
-            oci resource-manager job get-job-logs-content --job-id "$JOB_ID" | tail -n 40 || true
+          if [ "$STATE" = "SUCCEEDED" ]; then
+            echo "### :white_check_mark: Instancia A1 creada" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
 
+          # Los logs vienen como JSON con los saltos de linea escapados: sin el
+          # sed sale un unico churro de 40 KB donde no se lee nada.
+          LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null || true)
+          echo "--- errores del job ---"
+          echo "$LOGS" | sed 's/\\n/\n/g' | grep -E '\[ERROR\]|Error:' | head -n 10 || true
+
+          if echo "$LOGS" | grep -q 'Out of host capacity'; then
+            echo "resultado=SIN_CAPACIDAD" >> "$GITHUB_OUTPUT"
+            echo "### :no_entry: Oracle: Out of host capacity" >> "$GITHUB_STEP_SUMMARY"
+            echo "Si llegamos a pedir la maquina; no habia. Reintento normal." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### :x: Job en estado $STATE (no es falta de capacidad)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 1
+
       - name: Avisa si tuvo éxito
-        if: steps.apply.outputs.final_state == 'SUCCEEDED'
+        if: steps.apply.outputs.resultado == 'SUCCEEDED'
         run: |
           curl -s -d "✅ Instancia Oracle A1 (matcher besomm) creada con éxito. Revisa la consola OCI." \
             -H "Title: Oracle A1 disponible" \
