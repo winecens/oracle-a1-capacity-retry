@@ -1,0 +1,80 @@
+name: Inspect Oracle job (que pedimos realmente)
+
+# SOLO LECTURA. Vuelca de un job de Resource Manager ya ejecutado QUE se pidio
+# (shape, OCPUs, RAM, AD, imagen) y como acabo. Existe porque el retry.yml solo
+# imprimia las lineas de error del log de Terraform: se veia que Oracle contesto
+# "Out of host capacity", pero no que le hubieramos pedido la A1 correcta, asi
+# que lo del shape era inferencia y no observacion.
+#
+# ⛔ NO crea jobs: 'job list' y 'job get-job-logs-content' son GET, no tocan el
+# limite POST /jobs que nos da los 429. Se puede lanzar cuando se quiera.
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'OCID del job a inspeccionar (vacio = el ultimo del stack)'
+        required: false
+        default: ''
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install OCI CLI
+        run: pip install oci-cli
+
+      - name: Configura credenciales OCI
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/key.pem <<'EOF'
+          ${{ secrets.OCI_KEY_CONTENT }}
+          EOF
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<CFG
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/key.pem
+          CFG
+          chmod 600 ~/.oci/config
+
+      - name: Vuelca que se pidio en el job
+        run: |
+          set -uo pipefail
+
+          JOB_ID="${{ inputs.job_id }}"
+          if [ -z "$JOB_ID" ]; then
+            echo "Sin job_id: cojo el ultimo job del stack."
+            JOB_ID=$(oci --no-retry resource-manager job list \
+              --stack-id "${{ secrets.OCI_STACK_ID }}" \
+              --sort-by TIMECREATED --sort-order DESC --limit 1 \
+              --query 'data[0].id' --raw-output)
+          fi
+          echo "Job: $JOB_ID"
+
+          oci --no-retry resource-manager job get --job-id "$JOB_ID" \
+            --query 'data.{estado:"lifecycle-state",creado:"time-created",tipo:operation}' \
+            --output table || true
+
+          # Los logs vienen como JSON con los saltos de linea escapados.
+          LOGS=$(oci --no-retry resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null | sed 's/\\n/\n/g')
+
+          echo ""
+          echo "=== LO QUE PEDIMOS (del plan de Terraform) ==="
+          echo "$LOGS" | grep -E 'shape|ocpus|memory_in_gbs|availability_domain|source_id|display_name' \
+            | grep -vE '^\s*$' | head -n 25
+
+          echo ""
+          echo "=== COMO ACABO ==="
+          echo "$LOGS" | grep -E '\[ERROR\]|Error:|Plan:|Apply complete' | head -n 10
+
+          # Si el bloque de arriba sale vacio no es que no pidieramos nada: es
+          # que el formato del log cambio. Que se note, en vez de pasar por un
+          # "no aparece nada" que se lee como si estuviera bien.
+          if ! echo "$LOGS" | grep -q 'shape'; then
+            echo ""
+            echo "::warning::No se encontro 'shape' en el log del job. Revisar el formato antes de dar por bueno nada."
+          fi

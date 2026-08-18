@@ -92,9 +92,20 @@ jobs:
 
           # Los logs vienen como JSON con los saltos de linea escapados: sin el
           # sed sale un unico churro de 40 KB donde no se lee nada.
-          LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null || true)
+          LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null | sed 's/\\n/\n/g' || true)
+
+          # QUE hemos pedido, no solo que nos contestaron. Antes solo se
+          # imprimian las lineas de error, asi que un "Out of host capacity"
+          # demostraba que Oracle respondio pero NO que le pidieramos la A1
+          # correcta: el shape era inferencia. Con esto cada intento lo prueba.
+          echo "--- lo que hemos pedido ---"
+          echo "$LOGS" | grep -E 'shape|ocpus|memory_in_gbs|availability_domain' | head -n 8 || true
+          if ! echo "$LOGS" | grep -q 'shape'; then
+            echo "::warning::No aparece 'shape' en el log del job: revisar el formato antes de dar nada por bueno."
+          fi
+
           echo "--- errores del job ---"
-          echo "$LOGS" | sed 's/\\n/\n/g' | grep -E '\[ERROR\]|Error:' | head -n 10 || true
+          echo "$LOGS" | grep -E '\[ERROR\]|Error:' | head -n 10 || true
 
           if echo "$LOGS" | grep -q 'Out of host capacity'; then
             echo "resultado=SIN_CAPACIDAD" >> "$GITHUB_OUTPUT"
