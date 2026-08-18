@@ -1,15 +1,17 @@
 name: Retry Oracle A1 capacity
 
 on:
-  # RED DE SEGURIDAD, no el disparador principal: este cron se salta franjas
-  # bajo carga del runner compartido (llego 3 veces en 3,5 h, y tarde). Quien
-  # marca la cadencia real es el Worker de Cloudflare
-  # (wine-app/workers/oracle-retry-trigger, cron 5,25,45 = cada 20 min).
-  # Aqui basta 1/hora, en franja distinta para no encadenar dos Applies: el
-  # limite que nos frena es POST /jobs del Resource Manager (429 por tenant),
-  # y a 10 min mas de la mitad de los intentos ni llegaban a pedir capacidad.
-  schedule:
-    - cron: '0 * * * *'
+  # UN SOLO DISPARADOR: el Worker de Cloudflare
+  # (wine-app/workers/oracle-retry-trigger, cron 0,30 = cada 30 min), que
+  # dispara este workflow_dispatch.
+  #
+  # El cron nativo de GitHub ('0 * * * *') se retiro el 08-18: llegaba tarde y
+  # desplazado bajo carga del runner compartido, asi que en vez de repartirse la
+  # hora con el Worker se le encadenaba (17-08: dispatch 20:05 + schedule 20:14,
+  # 9 min de separacion). Y encadenar es justo lo que nos mata: el limite que
+  # nos frena es POST /jobs del Resource Manager (429 "Too many requests for the
+  # tenant"). Las 24 ejecuciones previas al 08-18 fallaron TODAS en 429 sin
+  # llegar a preguntar por capacidad: no sabiamos si habia A1 libre o no.
   workflow_dispatch: {}
 
 concurrency:
@@ -48,7 +50,12 @@ jobs:
         run: |
           set -uo pipefail
 
-          if ! JOB_ID=$(oci resource-manager job create-apply-job \
+          # --no-retry: sin el, el SDK reintenta con backoff dentro de la MISMA
+          # ejecucion y un solo intento nuestro se convierte en ~8 POST /jobs
+          # reales (el 429 tardaba 90-100 s en salir). A 4 intentos/hora eso son
+          # 20-30 peticiones/hora contra el endpoint que nos esta pidiendo que
+          # paremos: nos estabamos throttleando solos. Ahora 1 intento = 1 POST.
+          if ! JOB_ID=$(oci --no-retry resource-manager job create-apply-job \
                 --stack-id "${{ secrets.OCI_STACK_ID }}" \
                 --execution-plan-strategy AUTO_APPROVED \
                 --query 'data.id' --raw-output 2>/tmp/create_err.txt); then
