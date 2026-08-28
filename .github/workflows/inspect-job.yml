@@ -8,6 +8,12 @@ name: Inspect Oracle job (que pedimos realmente)
 #
 # ⛔ NO crea jobs: 'job list' y 'job get-job-logs-content' son GET, no tocan el
 # limite POST /jobs que nos da los 429. Se puede lanzar cuando se quiera.
+# ⚠️ CADUCADO EL 28-08-2026, LEER ANTES DE USARLO. El retry.yml ya NO pasa por
+# Resource Manager (pide la maquina directamente a Compute), asi que desde esa
+# fecha NO SE CREAN JOBS NUEVOS: sin argumentos, este workflow te devolvera
+# siempre el ULTIMO job de agosto y parecera informacion de hoy. Sirve solo para
+# auditar el historico anterior al 28-08. Lo que pedimos HOY sale en cada run
+# del retry, en el bloque "--- lo que hemos pedido ---" y en su anotacion.
 
 on:
   workflow_dispatch:
