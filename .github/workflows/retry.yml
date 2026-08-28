@@ -2,21 +2,47 @@ name: Retry Oracle A1 capacity
 
 on:
   # UN SOLO DISPARADOR: el Worker de Cloudflare
-  # (wine-app/workers/oracle-retry-trigger, cron 0,30 = cada 30 min), que
-  # dispara este workflow_dispatch.
+  # (wine-app/workers/oracle-retry-trigger, cron 0,20,40) que dispara este
+  # workflow_dispatch.
   #
   # El cron nativo de GitHub ('0 * * * *') se retiro el 08-18: llegaba tarde y
   # desplazado bajo carga del runner compartido, asi que en vez de repartirse la
   # hora con el Worker se le encadenaba (17-08: dispatch 20:05 + schedule 20:14,
-  # 9 min de separacion). Y encadenar es justo lo que nos mata: el limite que
-  # nos frena es POST /jobs del Resource Manager (429 "Too many requests for the
-  # tenant"). Las 24 ejecuciones previas al 08-18 fallaron TODAS en 429 sin
-  # llegar a preguntar por capacidad: no sabiamos si habia A1 libre o no.
+  # 9 min de separacion). Y encadenar es justo lo que nos mata cuando hay un
+  # limite por tenant de por medio.
   workflow_dispatch: {}
 
 concurrency:
   group: oracle-retry
   cancel-in-progress: false
+
+# ---------------------------------------------------------------------------
+# 08-28: SE DEJA DE PASAR POR RESOURCE MANAGER.
+#
+# Hasta hoy cada intento era un `POST /jobs` del Resource Manager para aplicar
+# el stack Terraform `besomm-matcher-a1`. Ese endpoint es el estrecho: medidos
+# 199 runs entre el 25-08 20:00 y el 28-08 14:20 UTC, **61 (31 %) murieron en
+# el 429 del tenant sin llegar a preguntar por capacidad** -- nunca dos
+# seguidos, pero en el ultimo tramo alternando uno si / uno no, o sea sondeando
+# de hecho cada 40 min. Se pide la maquina directamente a **Compute**
+# (`LaunchInstance`), que tiene throttling propio y mucho mas laxo y devuelve el
+# `Out of host capacity` en la respuesta de la propia llamada.
+#
+# ⚠️ CONSECUENCIA: el stack de Resource Manager sigue existiendo pero YA NO SE
+# APLICA, asi que su estado dira "0 recursos" aunque la instancia exista. Si
+# algun dia sale capacidad por aqui, NO lanzar un Apply de ese stack: intentaria
+# crear una SEGUNDA instancia. El paso `Comprueba si ya existe` de abajo protege
+# a este workflow, pero no protege a un Apply lanzado a mano.
+#
+# Para volver atras: `git revert` de este commit; el stack y el secreto
+# OCI_STACK_ID siguen intactos.
+#
+# ⚠️ Y lo mas util del cambio para el dia a dia: cada run publica su motivo
+# como ANOTACION (`::error::`/`::notice::`), que la API de GitHub sirve SIN
+# token (`/check-runs/<job_id>/annotations`). Antes el motivo vivia solo en el
+# log, que si pide token, y eso llevo a heredar 13 dias la conclusion falsa de
+# que "el 429 habia desaparecido". No quitar las anotaciones.
+# ---------------------------------------------------------------------------
 
 jobs:
   retry:
@@ -42,84 +68,226 @@ jobs:
           CFG
           chmod 600 ~/.oci/config
 
-      - name: Intenta crear la instancia (Apply del stack)
-        id: apply
-        # Verde = maquina creada. Cualquier otra cosa (429, sin capacidad, error
-        # de Terraform) sale en rojo. Antes el paso solo comprobaba que el job
-        # ARRANCARA, asi que un "Out of host capacity" salia como success.
+      - name: Comprueba si la instancia ya existe (solo GET)
+        id: guard
+        env:
+          COMPARTMENT: ${{ secrets.OCI_TENANCY }}
+        run: |
+          set -uo pipefail
+          # Sin Resource Manager no hay estado que nos frene: un segundo run
+          # despues de tener la maquina crearia OTRA (los display-name se pueden
+          # repetir). Este GET no toca ningun limite de escritura.
+          oci compute instance list -c "$COMPARTMENT" --all \
+            --display-name besomm-matcher-a1 --output json > /tmp/inst.json 2>/tmp/inst_err.txt || true
+          cat > /tmp/count_live.py <<'PY'
+          import json, os
+          p = '/tmp/inst.json'
+          if not os.path.exists(p) or os.path.getsize(p) == 0:
+              print('0'); raise SystemExit
+          try:
+              data = json.load(open(p)).get('data', [])
+          except Exception:
+              print('INDETERMINADO'); raise SystemExit
+          muertas = {'TERMINATED', 'TERMINATING'}
+          vivas = [i for i in data if i.get('lifecycle-state') not in muertas]
+          print(len(vivas))
+          for i in vivas:
+              print('   ', i.get('id'), i.get('lifecycle-state'), i.get('shape'))
+          PY
+          python3 /tmp/count_live.py > /tmp/live.txt
+          VIVAS=$(head -1 /tmp/live.txt)
+          echo "instancias besomm-matcher-a1 vivas: $VIVAS"
+          tail -n +2 /tmp/live.txt || true
+          if [ "$VIVAS" = "INDETERMINADO" ]; then
+            # No frenamos por esto: un duplicado solo es posible DESPUES de
+            # tener la maquina, y entonces ya habra saltado el ntfy.
+            echo "::warning::No se pudo determinar si la instancia existe; se sigue adelante. Error del list en el log."
+            sed -n '1,10p' /tmp/inst_err.txt || true
+            echo "ya_existe=no" >> "$GITHUB_OUTPUT"
+          elif [ "$VIVAS" != "0" ]; then
+            echo "ya_existe=si" >> "$GITHUB_OUTPUT"
+            echo "### :white_check_mark: Ya hay una A1 viva, no se pide nada" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::YA_EXISTE - hay $VIVAS instancia(s) besomm-matcher-a1 viva(s). Toca desactivar el cron del Worker (wine-app/workers/oracle-retry-trigger)."
+          else
+            echo "ya_existe=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pide la A1 directamente a Compute (LaunchInstance)
+        id: launch
+        if: steps.guard.outputs.ya_existe == 'no'
+        env:
+          COMPARTMENT: ${{ secrets.OCI_TENANCY }}
+          SUBNET_HINT: ${{ secrets.OCI_SUBNET_ID }}
+          SSH_PUBKEY: ${{ secrets.OCI_SSH_PUBKEY }}
         run: |
           set -uo pipefail
 
-          # --no-retry: sin el, el SDK reintenta con backoff dentro de la MISMA
-          # ejecucion y un solo intento nuestro se convierte en ~8 POST /jobs
-          # reales (el 429 tardaba 90-100 s en salir). A 4 intentos/hora eso son
-          # 20-30 peticiones/hora contra el endpoint que nos esta pidiendo que
-          # paremos: nos estabamos throttleando solos. Ahora 1 intento = 1 POST.
-          if ! JOB_ID=$(oci --no-retry resource-manager job create-apply-job \
-                --stack-id "${{ secrets.OCI_STACK_ID }}" \
-                --execution-plan-strategy AUTO_APPROVED \
-                --query 'data.id' --raw-output 2>/tmp/create_err.txt); then
-            echo "--- no se pudo crear el job ---"
-            cat /tmp/create_err.txt
-            if grep -q 'TooManyRequests' /tmp/create_err.txt; then
+          # --- Guardarrail que va PRIMERO por un motivo concreto -------------
+          # Una A1 creada sin ssh_authorized_keys es inservible: cloud-init solo
+          # inyecta la clave en el primer arranque, no se puede anadir despues.
+          # Habria que terminarla y volver a pedirla, tirando justo el hueco de
+          # capacidad que llevamos semanas esperando. Antes de pedir nada:
+          if [ -z "${SSH_PUBKEY:-}" ]; then
+            echo "::error::Falta el secreto OCI_SSH_PUBKEY. NO se lanza sin clave publica: la instancia saldria sin acceso SSH y habria que tirarla, perdiendo el hueco de capacidad."
+            exit 1
+          fi
+
+          # --- 1. Dominio de disponibilidad (GET) ---------------------------
+          AD=$(oci iam availability-domain list -c "$COMPARTMENT" \
+                 --query 'data[0].name' --raw-output) || AD=""
+          if [ -z "$AD" ]; then
+            echo "::error::No se pudo resolver el availability domain (ver log)."
+            exit 1
+          fi
+
+          # --- 2. Imagen, resuelta EN VIVO y filtrada por la shape ----------
+          # El OCID de la imagen venia fijo del stack y quedo anotado en 3.22.3
+          # como el ultimo eslabon INFERIDO: nunca se observo que fuera aarch64.
+          # Filtrando por --shape, la lista solo trae imagenes que arrancan en
+          # A1.Flex, asi que el eslabon se cierra por construccion y ademas se
+          # coge siempre el build mas reciente.
+          oci compute image list -c "$COMPARTMENT" \
+            --operating-system "Canonical Ubuntu" \
+            --operating-system-version "24.04" \
+            --shape VM.Standard.A1.Flex \
+            --sort-by TIMECREATED --sort-order DESC \
+            --output json > /tmp/images.json 2>/tmp/img_err.txt || true
+          cat > /tmp/pick_image.py <<'PY'
+          import json, os, sys
+          p = '/tmp/images.json'
+          if not os.path.exists(p) or os.path.getsize(p) == 0:
+              sys.exit('sin salida del image list')
+          data = json.load(open(p)).get('data', [])
+          if not data:
+              sys.exit('el image list no devolvio ninguna imagen')
+          # Las "Minimal" arrancan igual, pero el stack usaba la estandar:
+          # se mantiene la paridad y solo se cae a Minimal si no hay otra.
+          pref = [i for i in data if 'Minimal' not in i['display-name']] or data
+          print(pref[0]['id'])
+          print(pref[0]['display-name'])
+          PY
+          if ! mapfile -t IMG < <(python3 /tmp/pick_image.py); then :; fi
+          IMAGE_ID="${IMG[0]:-}"
+          IMAGE_NAME="${IMG[1]:-}"
+          if [ -z "$IMAGE_ID" ]; then
+            echo "::error::No se pudo resolver la imagen Ubuntu 24.04 para A1.Flex (ver log)."
+            sed -n '1,10p' /tmp/img_err.txt || true
+            exit 1
+          fi
+          case "$IMAGE_NAME" in
+            *aarch64*) : ;;
+            *) echo "::warning::La imagen elegida ($IMAGE_NAME) no dice aarch64 en el nombre. Viene filtrada por --shape A1.Flex, asi que deberia arrancar, pero revisalo." ;;
+          esac
+
+          # --- 3. Subred ----------------------------------------------------
+          SUBNET="${SUBNET_HINT:-}"
+          if [ -z "$SUBNET" ]; then
+            oci network subnet list -c "$COMPARTMENT" --all --output json > /tmp/subnets.json 2>/dev/null || true
+            cat > /tmp/pick_subnet.py <<'PY'
+          import json, os, sys
+          p = '/tmp/subnets.json'
+          if not os.path.exists(p) or os.path.getsize(p) == 0:
+              sys.exit('sin salida del subnet list')
+          data = json.load(open(p)).get('data', [])
+          vivas = [s for s in data if s.get('lifecycle-state') == 'AVAILABLE']
+          if len(vivas) != 1:
+              sys.exit('hay %d subredes: define el secreto OCI_SUBNET_ID' % len(vivas))
+          print(vivas[0]['id'])
+          PY
+            SUBNET=$(python3 /tmp/pick_subnet.py) || SUBNET=""
+          fi
+          if [ -z "$SUBNET" ]; then
+            echo "::error::No hay subred: define el secreto OCI_SUBNET_ID (el valor esta en wine-app/infra/oracle-matcher/main.tf)."
+            exit 1
+          fi
+
+          # --- 4. QUE estamos pidiendo, en el registro PUBLICO --------------
+          # Un "Out of host capacity" prueba que Oracle contesto, no que le
+          # pidieramos la maquina correcta. Esto lo deja escrito en cada run.
+          echo "--- lo que hemos pedido ---"
+          echo "shape=VM.Standard.A1.Flex ocpus=1 memory_in_gbs=6"
+          echo "availability_domain=$AD"
+          echo "image=$IMAGE_NAME"
+          echo "::notice::PEDIMOS A1.Flex 1 OCPU / 6 GB en $AD con imagen $IMAGE_NAME"
+
+          # --- 5. La peticion, un solo POST --------------------------------
+          # --no-retry: sin el, el SDK reintenta con backoff DENTRO de la misma
+          # ejecucion y un intento nuestro se convierte en ~8 peticiones reales
+          # contra el endpoint que nos esta pidiendo que paremos.
+          jq -n --arg k "$SSH_PUBKEY" '{ssh_authorized_keys:$k}' > /tmp/metadata.json
+          if ! OCID=$(oci --no-retry compute instance launch \
+                -c "$COMPARTMENT" \
+                --availability-domain "$AD" \
+                --shape VM.Standard.A1.Flex \
+                --shape-config '{"ocpus":1,"memoryInGBs":6}' \
+                --subnet-id "$SUBNET" \
+                --assign-public-ip true \
+                --image-id "$IMAGE_ID" \
+                --display-name besomm-matcher-a1 \
+                --metadata file:///tmp/metadata.json \
+                --is-pv-encryption-in-transit-enabled true \
+                --availability-config '{"recoveryAction":"RESTORE_INSTANCE"}' \
+                --query 'data.id' --raw-output 2>/tmp/launch_err.txt); then
+
+            echo "--- error real de Oracle ---"
+            sed -n '1,40p' /tmp/launch_err.txt
+
+            # Los tres desenlaces significan cosas distintas y solo uno es
+            # "esperar". La anotacion los deja legibles SIN token.
+            if grep -qi 'out of host capacity' /tmp/launch_err.txt; then
+              echo "resultado=SIN_CAPACIDAD" >> "$GITHUB_OUTPUT"
+              echo "### :no_entry: Oracle: Out of host capacity" >> "$GITHUB_STEP_SUMMARY"
+              echo "Si llegamos a pedir la maquina; no habia. Reintento normal." >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::SIN_CAPACIDAD - pedimos A1.Flex 1 OCPU/6 GB en $AD y Oracle no tenia hueco. Es el fallo bueno: solo cabe esperar."
+            elif grep -qiE 'toomanyrequests|429' /tmp/launch_err.txt; then
               echo "resultado=RATE_LIMITED" >> "$GITHUB_OUTPUT"
-              echo "### :hourglass: 429 del Resource Manager" >> "$GITHUB_STEP_SUMMARY"
-              echo "No se llego a preguntar por capacidad. Espaciar mas los intentos." >> "$GITHUB_STEP_SUMMARY"
+              echo "### :hourglass: 429, esta vez de Compute" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::RATE_LIMITED - 429 en LaunchInstance (Compute, no Resource Manager). No se llego a preguntar por capacidad. Si sale en racha, espaciar el cron del Worker."
+            elif grep -qiE 'limitexceeded|quota|servicelimit' /tmp/launch_err.txt; then
+              echo "resultado=LIMITE" >> "$GITHUB_OUTPUT"
+              echo "### :x: Limite de servicio / Always Free" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::LIMITE - Oracle dice limite de servicio, no falta de capacidad. Revisar si ya hay una A1 contando contra el cupo (2 OCPU/12 GB desde el 15-06-2026)."
             else
               echo "resultado=ERROR_CLIENTE" >> "$GITHUB_OUTPUT"
-              echo "### :x: Error al crear el job (ver log del runner)" >> "$GITHUB_STEP_SUMMARY"
+              echo "### :x: Error nuestro (Terraform/credenciales/shape)" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::ERROR_CLIENTE - ni capacidad ni 429: el fallo es nuestro. Abrir el log del run."
             fi
             exit 1
           fi
-          echo "Job creado: $JOB_ID"
 
-          STATE="ACCEPTED"
-          for i in $(seq 1 40); do
-            STATE=$(oci resource-manager job get --job-id "$JOB_ID" --query 'data."lifecycle-state"' --raw-output) || STATE="DESCONOCIDO"
+          # --- 6. Hay maquina ------------------------------------------------
+          echo "resultado=CREADA" >> "$GITHUB_OUTPUT"
+          echo "instance_id=$OCID" >> "$GITHUB_OUTPUT"
+          echo "::notice::A1 CREADA. Desactiva el cron del Worker (wine-app/workers/oracle-retry-trigger) para no pedir una segunda."
+          echo "### :white_check_mark: Instancia A1 creada" >> "$GITHUB_STEP_SUMMARY"
+
+          # El hueco ya es nuestro; el arranque es otra cosa. Se espera un rato
+          # a que pase a RUNNING para dar tambien la IP, pero un timeout aqui NO
+          # debe pintar el run en rojo: la maquina existe.
+          IP=""
+          for i in $(seq 1 20); do
+            STATE=$(oci compute instance get --instance-id "$OCID" \
+                      --query 'data."lifecycle-state"' --raw-output) || STATE="DESCONOCIDO"
             echo "Estado ($i): $STATE"
-            if [ "$STATE" = "SUCCEEDED" ] || [ "$STATE" = "FAILED" ]; then
+            if [ "$STATE" = "RUNNING" ]; then
+              IP=$(oci compute instance list-vnics --instance-id "$OCID" \
+                     --query 'data[0]."public-ip"' --raw-output 2>/dev/null) || IP=""
+              break
+            fi
+            if [ "$STATE" = "TERMINATED" ] || [ "$STATE" = "TERMINATING" ]; then
+              echo "::warning::La instancia se creo y paso a $STATE. Revisar en la consola OCI."
               break
             fi
             sleep 15
           done
-
-          echo "resultado=$STATE" >> "$GITHUB_OUTPUT"
-
-          if [ "$STATE" = "SUCCEEDED" ]; then
-            echo "### :white_check_mark: Instancia A1 creada" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          # Los logs vienen como JSON con los saltos de linea escapados: sin el
-          # sed sale un unico churro de 40 KB donde no se lee nada.
-          LOGS=$(oci resource-manager job get-job-logs-content --job-id "$JOB_ID" 2>/dev/null | sed 's/\\n/\n/g' || true)
-
-          # QUE hemos pedido, no solo que nos contestaron. Antes solo se
-          # imprimian las lineas de error, asi que un "Out of host capacity"
-          # demostraba que Oracle respondio pero NO que le pidieramos la A1
-          # correcta: el shape era inferencia. Con esto cada intento lo prueba.
-          echo "--- lo que hemos pedido ---"
-          echo "$LOGS" | grep -E 'shape|ocpus|memory_in_gbs|availability_domain' | head -n 8 || true
-          if ! echo "$LOGS" | grep -q 'shape'; then
-            echo "::warning::No aparece 'shape' en el log del job: revisar el formato antes de dar nada por bueno."
-          fi
-
-          echo "--- errores del job ---"
-          echo "$LOGS" | grep -E '\[ERROR\]|Error:' | head -n 10 || true
-
-          if echo "$LOGS" | grep -q 'Out of host capacity'; then
-            echo "resultado=SIN_CAPACIDAD" >> "$GITHUB_OUTPUT"
-            echo "### :no_entry: Oracle: Out of host capacity" >> "$GITHUB_STEP_SUMMARY"
-            echo "Si llegamos a pedir la maquina; no habia. Reintento normal." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### :x: Job en estado $STATE (no es falta de capacidad)" >> "$GITHUB_STEP_SUMMARY"
-          fi
-          exit 1
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "IP publica: ${IP:-sin resolver todavia}" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
 
       - name: Avisa si tuvo éxito
-        if: steps.apply.outputs.resultado == 'SUCCEEDED'
+        if: steps.launch.outputs.resultado == 'CREADA'
         run: |
-          curl -s -d "✅ Instancia Oracle A1 (matcher besomm) creada con éxito. Revisa la consola OCI." \
+          curl -s -d "✅ Instancia Oracle A1 (matcher besomm) CREADA. IP: ${{ steps.launch.outputs.ip }} - OCID: ${{ steps.launch.outputs.instance_id }}. Desactiva el cron del Worker." \
             -H "Title: Oracle A1 disponible" \
             -H "Priority: high" \
             "ntfy.sh/${{ secrets.NTFY_TOPIC }}"
