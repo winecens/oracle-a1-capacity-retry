@@ -46,10 +46,14 @@ concurrency:
 
 jobs:
   retry:
-    runs-on: ubuntu-latest
+    # Imagen y CLI FIJADAS (09-28, blueprint 3.22.6): ubuntu-latest pasa a
+    # Ubuntu 26 el 19-10-2026 y un oci-cli nuevo puede cambiar la salida que
+    # clasificamos. Un cambio silencioso aqui pintaria ERROR_CLIENTE en cada
+    # run sin que Oracle llegue a oir la peticion. Subirlas a mano, a proposito.
+    runs-on: ubuntu-24.04
     steps:
       - name: Install OCI CLI
-        run: pip install oci-cli
+        run: pip install oci-cli==3.94.0
 
       - name: Configura credenciales OCI
         run: |
